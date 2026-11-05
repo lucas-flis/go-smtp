@@ -343,6 +343,185 @@ func TestServerAcceptErrorHandling(t *testing.T) {
 	}
 }
 
+func TestServerClosesListenerOnAcceptError(t *testing.T) {
+	s := smtp.NewServer(new(backend))
+	s.ErrorLog = log.New(ioutil.Discard, "", 0)
+
+	l := newFailingListener()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(l) }()
+
+	permanentError := newMockError("permanent mock error", false)
+	l.Send(permanentError)
+	if err := receive(t, done, "Serve to return"); err != permanentError {
+		t.Fatal("Expected the permanent error, got:", err)
+	}
+	l.mu.Lock()
+	closed := l.closed
+	l.mu.Unlock()
+	if !closed {
+		t.Fatal("Expected Serve to close the listener")
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatal("Shutdown failed:", err)
+	}
+}
+
+// stopListener starts stop once it accepted a connection, and returns that
+// connection once stop closed the listener: the server stops while the
+// connection is being accepted. connClosed is closed with that connection.
+type stopListener struct {
+	net.Listener
+	stop       func()
+	once       sync.Once
+	closed     chan struct{}
+	connClosed chan struct{}
+}
+
+func (l *stopListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.once.Do(func() {
+		c = &notifyConn{Conn: c, closed: l.connClosed}
+		go l.stop()
+		<-l.closed
+	})
+	return c, nil
+}
+
+// notifyConn closes closed when it is closed.
+type notifyConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (c *notifyConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func (l *stopListener) Close() error {
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+	}
+	return l.Listener.Close()
+}
+
+// receive waits at most five seconds for a value of ch.
+func receive(t *testing.T, ch <-chan error, what string) error {
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for %s", what)
+		return nil
+	}
+}
+
+// testServerStopDuringAccept checks that a connection accepted while stop
+// stops the server is refused with a 421 and closed, rather than served
+// after Close (which missed it) or after Shutdown returned (which did not
+// wait for it). With waits, stop must return only once the connection was
+// refused.
+func testServerStopDuringAccept(t *testing.T, waits bool, stop func(s *smtp.Server) error) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	be := new(backend)
+	s := smtp.NewServer(be)
+	s.Domain = "localhost"
+	s.AllowInsecureAuth = true
+
+	stopErr := make(chan error, 1)
+	l := &stopListener{
+		Listener:   inner,
+		stop:       func() { stopErr <- stop(s) },
+		closed:     make(chan struct{}),
+		connClosed: make(chan struct{}),
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(l) }()
+
+	c, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := receive(t, stopErr, "the server to stop"); err != nil {
+		t.Fatal("Stopping the server failed:", err)
+	}
+	if waits {
+		select {
+		case <-l.connClosed:
+		default:
+			t.Fatal("The server stopped before the connection was refused")
+		}
+	}
+	if err := receive(t, done, "Serve to return"); err != nil {
+		t.Fatal("Serve failed:", err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	b, err := ioutil.ReadAll(c)
+	if err != nil || string(b) != "421 4.3.2 Service shutting down\r\n" {
+		t.Fatalf("Expected a 421 reply and the connection closed, got %q, %v", b, err)
+	}
+}
+
+func TestServerCloseDuringAccept(t *testing.T) {
+	testServerStopDuringAccept(t, false, func(s *smtp.Server) error {
+		return s.Close()
+	})
+}
+
+func TestServerShutdownDuringAccept(t *testing.T) {
+	testServerStopDuringAccept(t, true, func(s *smtp.Server) error {
+		return s.Shutdown(context.Background())
+	})
+}
+
+// testServerServeAfterStop checks that Serve, called once stop stopped the
+// server, returns ErrServerClosed at once and closes its listener.
+func testServerServeAfterStop(t *testing.T, stop func(s *smtp.Server) error) {
+	s := smtp.NewServer(new(backend))
+	if err := stop(s); err != nil {
+		t.Fatal("Stopping the server failed:", err)
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(l) }()
+	if err := receive(t, done, "Serve to return"); err != smtp.ErrServerClosed {
+		t.Fatal("Expected ErrServerClosed, got:", err)
+	}
+	if c, err := net.Dial("tcp", l.Addr().String()); err == nil {
+		c.Close()
+		t.Fatal("Expected the listener to be closed")
+	}
+}
+
+func TestServerServeAfterClose(t *testing.T) {
+	testServerServeAfterStop(t, func(s *smtp.Server) error {
+		return s.Close()
+	})
+}
+
+func TestServerServeAfterShutdown(t *testing.T) {
+	testServerServeAfterStop(t, func(s *smtp.Server) error {
+		return s.Shutdown(context.Background())
+	})
+}
+
 func TestServer_helo(t *testing.T) {
 	_, s, c, scanner := testServerGreeted(t)
 	defer s.Close()
